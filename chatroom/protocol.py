@@ -123,12 +123,18 @@ def create_leader_info_message(
     )
 
 
-def create_join_message(node_id: int, host: str, port: int) -> Dict[str, Any]:
+def create_join_message(
+    node_id: int,
+    host: str,
+    port: int,
+    last_delivered_seq: int = 0,
+) -> Dict[str, Any]:
     return create_message(
         MessageType.JOIN,
         node_id,
         tcp_host=host,
         tcp_port=int(port),
+        last_delivered_seq=int(last_delivered_seq),
     )
 
 

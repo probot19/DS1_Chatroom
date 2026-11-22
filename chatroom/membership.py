@@ -178,6 +178,11 @@ class MembershipManager:
         self.on_leader_crashed = on_leader_crashed
         self.logger = logger or logging.getLogger(f"Membership-{node_id}")
 
+        # Reconnect catch-up hooks
+        self.last_delivered_seq_getter: Optional[Callable[[], int]] = None
+        self.get_history_delta: Optional[Callable[[int], List[Dict[str, Any]]]] = None
+        self.on_catch_up: Optional[Callable[[List[Dict[str, Any]]], Any]] = None
+
         self.table = MembershipTable()
         self._is_running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -255,7 +260,8 @@ class MembershipManager:
 
     async def _join_leader(self, leader_id: int, leader_host: str, leader_port: int) -> None:
         """Send framed TCP JOIN request to the leader and process JOIN_ACK."""
-        join_req = create_join_message(self.node_id, self.host, self.port)
+        last_seq = self.last_delivered_seq_getter() if self.last_delivered_seq_getter else 0
+        join_req = create_join_message(self.node_id, self.host, self.port, last_delivered_seq=last_seq)
         try:
             ack = await self.tcp_transport.send_request(leader_host, leader_port, join_req, timeout=3.0)
             if ack.get("type") != MessageType.JOIN_ACK:
@@ -274,6 +280,13 @@ class MembershipManager:
                 role="FOLLOWER",
                 last_seen=time.time(),
             )
+
+            # Reconnect catch-up: process missed messages if provided in JOIN_ACK
+            delta_history = ack.get("history", [])
+            if delta_history and self.on_catch_up:
+                res = self.on_catch_up(delta_history)
+                if asyncio.iscoroutine(res):
+                    await res
 
             member_ids = [p.node_id for p in self.table.all_members()]
             self.logger.info(
@@ -377,6 +390,7 @@ class MembershipManager:
 
             new_host = str(msg.get("tcp_host", writer.get_extra_info("peername")[0]))
             new_port = int(msg["tcp_port"])
+            last_seq = int(msg.get("last_delivered_seq", 0))
 
             self.table.add_or_update(
                 node_id=sender_id,
@@ -385,12 +399,16 @@ class MembershipManager:
                 role="FOLLOWER",
                 last_seen=time.time(),
             )
-            self.logger.info("Node %d joined via TCP (%s:%d)", sender_id, new_host, new_port)
+            self.logger.info("Node %d joined via TCP (%s:%d, last_delivered_seq=%d)", sender_id, new_host, new_port, last_seq)
+
+            # Compute delta history for catch-up
+            delta = self.get_history_delta(last_seq) if self.get_history_delta else []
 
             # Reply with JOIN_ACK
             ack = create_join_ack_message(
                 leader_id=self.node_id,
                 membership=self.table.to_dict(),
+                history=delta,
             )
             await send_framed_message(writer, ack)
 

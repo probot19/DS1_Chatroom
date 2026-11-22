@@ -19,6 +19,7 @@ from chatroom.election import ElectionManager
 from chatroom.membership import MembershipManager, MembershipTable
 from chatroom.multicast import MulticastManager, OrderedMessage
 from chatroom.protocol import MessageType, create_message, send_framed_message
+from chatroom.storage import StorageManager
 from chatroom.transport import MulticastTransport, TcpTransport, get_lan_ip
 
 
@@ -40,6 +41,7 @@ class Node:
         heartbeat_timeout: float = 2.5,
         election_timeout: float = 1.5,
         reconciliation_timeout: float = 1.5,
+        data_dir: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.node_id = node_id
@@ -52,12 +54,24 @@ class Node:
         self.heartbeat_timeout = heartbeat_timeout
         self.election_timeout = election_timeout
         self.reconciliation_timeout = reconciliation_timeout
+        self.data_dir = data_dir
 
         self.logger = logger or logging.getLogger(f"Node-{node_id}")
 
         # Local history and sequence number state for reconciliation
         self.local_max_seq: int = 0
         self.local_history: list = []
+
+        # Local JSON disk persistence (enabled when data_dir is provided)
+        self.storage: Optional[StorageManager] = (
+            StorageManager(
+                node_id=self.node_id,
+                data_dir=self.data_dir,
+                logger=self.logger,
+            )
+            if self.data_dir is not None
+            else None
+        )
 
         # Transport instances
         self.tcp_transport = TcpTransport(
@@ -91,6 +105,13 @@ class Node:
             on_leader_crashed=self._on_leader_crashed,
             logger=self.logger,
         )
+
+        # Connect reconnect catch-up hooks
+        self.membership.last_delivered_seq_getter = lambda: (
+            max(self.local_max_seq, self.multicast.expected_seq - 1)
+        )
+        self.membership.get_history_delta = self._get_history_delta
+        self.membership.on_catch_up = self._on_catch_up
 
         # Election Manager (Bully Algorithm + State Reconciliation)
         self.election = ElectionManager(
@@ -163,7 +184,29 @@ class Node:
 
     def _on_chat_delivered(self, msg: OrderedMessage) -> None:
         """Callback when a chat message is delivered in total order."""
-        pass
+        # Save delivered message history to disk if persistence is enabled
+        if self.storage:
+            self.storage.save_history(self.multicast.delivered_messages)
+
+    def _get_history_delta(self, last_seq: int) -> List[Dict[str, Any]]:
+        """Return history messages strictly after last_seq for reconnect catch-up."""
+        # Check both sequencer chat_history and delivered_messages
+        source = self.multicast.chat_history if self.role == "LEADER" else {m.seq: m for m in self.multicast.delivered_messages}
+        delta = [
+            m.to_dict()
+            for seq, m in sorted(source.items())
+            if seq > last_seq
+        ]
+        return delta
+
+    async def _on_catch_up(self, delta_history: List[Dict[str, Any]]) -> None:
+        """Process catch-up history delivered during reconnect."""
+        if not delta_history:
+            return
+        self.logger.info("Catching up on %d missed message(s) from leader...", len(delta_history))
+        for item in delta_history:
+            m = OrderedMessage.from_dict(item)
+            await self.multicast._deliver_ordered_message(m)
 
     async def send_chat(self, text: str, msg_id: Optional[str] = None) -> str:
         """Public API: send a chat message to the room with Total Order."""
@@ -179,10 +222,24 @@ class Node:
         asyncio.create_task(self.election.start_election(f"leader_{leader_id}_heartbeat_timeout"))
 
     async def start(self) -> None:
-        """Initialize transports and start discovery and membership services."""
+        """Initialize transports, load persisted history, and start discovery."""
         if self._is_running:
             return
         self._is_running = True
+
+        # Load persisted local history if persistence is enabled
+        if self.storage:
+            last_seq, stored_history = self.storage.load_history()
+            if stored_history:
+                self.multicast.expected_seq = last_seq + 1
+                self.multicast.delivered_messages = list(stored_history)
+                self.multicast.delivered_msg_ids = {m.msg_id for m in stored_history}
+                self.multicast.chat_history = {m.seq: m for m in stored_history}
+                self.local_max_seq = last_seq
+                self.local_history = [m.to_dict() for m in stored_history]
+                if self.initial_role == "LEADER":
+                    self.multicast.current_seq = last_seq
+                self.logger.info("Restored local history: last_seq=%d (%d messages)", last_seq, len(stored_history))
 
         actual_port = await self.tcp_transport.start()
         self.tcp_port = actual_port

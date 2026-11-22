@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+from chatroom.cli import CommandLineInterface
 from chatroom.node import Node
 from chatroom.protocol import MessageType, create_message, send_framed_message
 from chatroom.transport import MulticastTransport, TcpTransport, get_lan_ip
@@ -35,6 +36,7 @@ class Config:
     heartbeat_timeout: float = 2.5
     election_timeout: float = 2.0
     ack_timeout: float = 1.5
+    data_dir: str = ".chat_data"
 
 
 class NodeLogFormatter(logging.Formatter):
@@ -207,6 +209,8 @@ async def run_node(config: Config) -> None:
         initial_role=config.role,
         heartbeat_interval=config.heartbeat_interval,
         heartbeat_timeout=config.heartbeat_timeout,
+        election_timeout=config.election_timeout,
+        data_dir=config.data_dir,
     )
 
     logger = setup_logger(config.node_id, lambda: node.role)
@@ -214,14 +218,18 @@ async def run_node(config: Config) -> None:
     node.tcp_transport.logger = logger
     node.mcast_transport.logger = logger
     node.membership.logger = logger
+    node.election.logger = logger
+    node.multicast.logger = logger
+    if node.storage:
+        node.storage.logger = logger
 
     await node.start()
 
-    stop_event = asyncio.Event()
+    cli = CommandLineInterface(node, logger=logger)
 
     def signal_handler() -> None:
         logger.info("Shutdown signal caught. Commencing clean leave...")
-        stop_event.set()
+        cli.stop()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -230,52 +238,9 @@ async def run_node(config: Config) -> None:
         except NotImplementedError:
             pass
 
-    # Non-blocking terminal CLI reader if running in interactive terminal
-    async def stdin_reader() -> None:
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        try:
-            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-        except Exception:
-            return  # Stdin not attached or not pipeable
-
-        while not stop_event.is_set():
-            line_bytes = await reader.readline()
-            if not line_bytes:
-                break
-            cmd = line_bytes.decode("utf-8").strip()
-            if cmd == "/members":
-                members = node.table.all_members()
-                logger.info("Current Cluster Members (%d total):", len(members))
-                for m in members:
-                    alive_str = "ALIVE" if m.is_alive else "SUSPECTED/CRASHED"
-                    logger.info(
-                        "  - Node %d: %s:%d [%s] (status: %s, last seen: %.1fs ago)",
-                        m.node_id,
-                        m.host,
-                        m.port,
-                        m.role,
-                        alive_str,
-                        time.time() - m.last_seen,
-                    )
-            elif cmd == "/status":
-                logger.info(
-                    "Node Status: Node ID %d | Role: %s | Leader: %s | Port: %d",
-                    node.node_id,
-                    node.role,
-                    node.leader_id,
-                    node.tcp_port,
-                )
-            elif cmd in ("/leave", "/quit"):
-                stop_event.set()
-                break
-
-    stdin_task = asyncio.create_task(stdin_reader())
-
     try:
-        await stop_event.wait()
+        await cli.run()
     finally:
-        stdin_task.cancel()
         await node.stop()
 
 
@@ -334,6 +299,12 @@ def parse_args() -> Tuple[Config, bool]:
         help="Heartbeat silence timeout before declaring crash in seconds (default: 2.5)",
     )
     parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=".chat_data",
+        help="Local directory for persistent chat history (default: .chat_data)",
+    )
+    parser.add_argument(
         "--demo-ping",
         action="store_true",
         help="Run Milestone 1 interactive transport test",
@@ -351,6 +322,7 @@ def parse_args() -> Tuple[Config, bool]:
         role=args.role,
         heartbeat_interval=args.heartbeat_interval,
         heartbeat_timeout=args.heartbeat_timeout,
+        data_dir=args.data_dir,
     )
     return cfg, args.demo_ping
 
