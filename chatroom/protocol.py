@@ -176,6 +176,53 @@ def create_heartbeat_message(sender_id: int, role: str) -> Dict[str, Any]:
     )
 
 
+# =====================================================================
+# Milestone 3: Bully Election & State Reconciliation Helpers
+# =====================================================================
+
+def create_election_message(sender_id: int) -> Dict[str, Any]:
+    return create_message(
+        MessageType.ELECTION,
+        sender_id,
+    )
+
+
+def create_answer_message(sender_id: int) -> Dict[str, Any]:
+    return create_message(
+        MessageType.ANSWER,
+        sender_id,
+    )
+
+
+def create_coordinator_message(sender_id: int, max_seq: int = 0) -> Dict[str, Any]:
+    return create_message(
+        MessageType.COORDINATOR,
+        sender_id,
+        leader_id=int(sender_id),
+        max_seq=int(max_seq),
+    )
+
+
+def create_state_req_message(sender_id: int) -> Dict[str, Any]:
+    return create_message(
+        MessageType.STATE_REQ,
+        sender_id,
+    )
+
+
+def create_state_res_message(
+    sender_id: int,
+    max_seq: int,
+    history: Optional[list] = None,
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.STATE_RES,
+        sender_id,
+        max_seq=int(max_seq),
+        history=history or [],
+    )
+
+
 def encode_framed_bytes(msg: Dict[str, Any]) -> bytes:
     """
     Serialize a message dictionary to UTF-8 JSON bytes and prepend

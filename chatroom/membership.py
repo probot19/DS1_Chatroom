@@ -514,6 +514,7 @@ class MembershipManager:
                         self._notify_change("CRASH_TIMEOUT", peer.node_id)
 
                     elif peer.node_id == self.leader_id:
+                        peer.is_alive = False
                         self.logger.warning("Leader Node %d has crashed!", peer.node_id)
                         if self.on_leader_crashed:
                             res = self.on_leader_crashed(peer.node_id)

@@ -15,6 +15,7 @@ import asyncio
 import logging
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from chatroom.election import ElectionManager
 from chatroom.membership import MembershipManager, MembershipTable
 from chatroom.protocol import MessageType, create_message, send_framed_message
 from chatroom.transport import MulticastTransport, TcpTransport, get_lan_ip
@@ -36,6 +37,8 @@ class Node:
         initial_role: str = "FOLLOWER",
         heartbeat_interval: float = 0.8,
         heartbeat_timeout: float = 2.5,
+        election_timeout: float = 1.5,
+        reconciliation_timeout: float = 1.5,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.node_id = node_id
@@ -46,8 +49,14 @@ class Node:
         self.initial_role = initial_role
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_timeout = heartbeat_timeout
+        self.election_timeout = election_timeout
+        self.reconciliation_timeout = reconciliation_timeout
 
         self.logger = logger or logging.getLogger(f"Node-{node_id}")
+
+        # Local history and sequence number state for reconciliation
+        self.local_max_seq: int = 0
+        self.local_history: list = []
 
         # Transport instances
         self.tcp_transport = TcpTransport(
@@ -78,6 +87,20 @@ class Node:
             heartbeat_interval=self.heartbeat_interval,
             heartbeat_timeout=self.heartbeat_timeout,
             on_membership_changed=self._on_membership_changed,
+            on_leader_crashed=self._on_leader_crashed,
+            logger=self.logger,
+        )
+
+        # Election Manager (Bully Algorithm + State Reconciliation)
+        self.election = ElectionManager(
+            node_id=self.node_id,
+            table=self.membership.table,
+            tcp_transport=self.tcp_transport,
+            election_timeout=self.election_timeout,
+            reconciliation_timeout=self.reconciliation_timeout,
+            get_local_state=self._get_local_state,
+            on_elected=self._on_elected,
+            on_new_leader=self._on_new_leader,
             logger=self.logger,
         )
 
@@ -94,6 +117,31 @@ class Node:
     @property
     def table(self) -> MembershipTable:
         return self.membership.table
+
+    def _get_local_state(self) -> Tuple[int, list]:
+        """Return (max_delivered_seq, chat_history_list) for state reconciliation."""
+        return self.local_max_seq, self.local_history
+
+    def _on_elected(self, leader_id: int, max_seq: int, history: list) -> None:
+        """Callback when this node wins election and finishes reconciliation."""
+        self.membership.role = "LEADER"
+        self.membership.leader_id = leader_id
+        self.local_max_seq = max_seq
+        self.local_history = history
+        self.logger.info("Node %d is elected LEADER. Reconciled max sequence: %d", leader_id, max_seq)
+
+    def _on_new_leader(self, leader_id: int, max_seq: int) -> None:
+        """Callback when another node claims COORDINATOR."""
+        self.membership.role = "FOLLOWER"
+        self.membership.leader_id = leader_id
+        if max_seq > self.local_max_seq:
+            self.local_max_seq = max_seq
+        self.logger.info("Acknowledged new cluster LEADER Node %d (max_seq=%d)", leader_id, max_seq)
+
+    def _on_leader_crashed(self, leader_id: int) -> None:
+        """Invoked by failure detector when heartbeat timeout expires for leader."""
+        self.logger.warning("Leader Node %d crashed! Triggering Bully election...", leader_id)
+        asyncio.create_task(self.election.start_election(f"leader_{leader_id}_heartbeat_timeout"))
 
     async def start(self) -> None:
         """Initialize transports and start discovery and membership services."""
@@ -123,12 +171,17 @@ class Node:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Route incoming TCP messages to respective layers."""
-        # 1. Membership messages (JOIN, LEAVE, MEMBERSHIP_UPDATE)
+        # 1. Election messages (ELECTION, ANSWER, COORDINATOR, STATE_REQ, STATE_RES)
+        handled = await self.election.handle_tcp_message(msg, reader, writer)
+        if handled:
+            return
+
+        # 2. Membership messages (JOIN, LEAVE, MEMBERSHIP_UPDATE)
         handled = await self.membership.handle_tcp_message(msg, reader, writer)
         if handled:
             return
 
-        # 2. Diagnostics / Echo messages
+        # 3. Diagnostics / Echo messages
         mtype = msg.get("type")
         sender = msg.get("sender_id")
         if mtype in (MessageType.PING, MessageType.TEST_TCP):
@@ -160,6 +213,17 @@ class Node:
             reason,
             affected_node_id,
         )
+
+        # Check for higher-ID preemption when a new node joins or is acknowledged
+        if affected_node_id and affected_node_id > self.node_id and self.role == "LEADER":
+            self.election.check_higher_id_preemption(affected_node_id)
+        elif self.role == "FOLLOWER" and self.leader_id and self.node_id > self.leader_id:
+            self.logger.info(
+                "Self Node %d has higher ID than current leader Node %d. Initiating election.",
+                self.node_id,
+                self.leader_id,
+            )
+            asyncio.create_task(self.election.start_election("higher_self_id_than_leader"))
 
     async def stop(self) -> None:
         """Cleanly leave the group and shut down all network services."""
