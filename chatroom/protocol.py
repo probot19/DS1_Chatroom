@@ -95,6 +95,87 @@ def validate_envelope(msg: Any) -> bool:
     return True
 
 
+# =====================================================================
+# Milestone 2: Discovery, Membership & Heartbeat Message Helpers
+# =====================================================================
+
+def create_announce_message(node_id: int, host: str, port: int) -> Dict[str, Any]:
+    return create_message(
+        MessageType.ANNOUNCE,
+        node_id,
+        tcp_host=host,
+        tcp_port=int(port),
+    )
+
+
+def create_leader_info_message(
+    sender_id: int,
+    leader_id: int,
+    leader_host: str,
+    leader_port: int,
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.LEADER_INFO,
+        sender_id,
+        leader_id=int(leader_id),
+        leader_host=leader_host,
+        leader_port=int(leader_port),
+    )
+
+
+def create_join_message(node_id: int, host: str, port: int) -> Dict[str, Any]:
+    return create_message(
+        MessageType.JOIN,
+        node_id,
+        tcp_host=host,
+        tcp_port=int(port),
+    )
+
+
+def create_join_ack_message(
+    leader_id: int,
+    membership: Dict[str, Any],
+    history: Optional[list] = None,
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.JOIN_ACK,
+        leader_id,
+        leader_id=int(leader_id),
+        membership=membership,
+        history=history or [],
+    )
+
+
+def create_leave_message(node_id: int) -> Dict[str, Any]:
+    return create_message(
+        MessageType.LEAVE,
+        node_id,
+    )
+
+
+def create_membership_update_message(
+    leader_id: int,
+    membership: Dict[str, Any],
+    reason: str,
+    affected_node_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.MEMBERSHIP_UPDATE,
+        leader_id,
+        membership=membership,
+        reason=reason,
+        affected_node_id=affected_node_id,
+    )
+
+
+def create_heartbeat_message(sender_id: int, role: str) -> Dict[str, Any]:
+    return create_message(
+        MessageType.HEARTBEAT,
+        sender_id,
+        role=role,
+    )
+
+
 def encode_framed_bytes(msg: Dict[str, Any]) -> bytes:
     """
     Serialize a message dictionary to UTF-8 JSON bytes and prepend

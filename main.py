@@ -14,8 +14,9 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
+from chatroom.node import Node
 from chatroom.protocol import MessageType, create_message, send_framed_message
 from chatroom.transport import MulticastTransport, TcpTransport, get_lan_ip
 
@@ -30,8 +31,8 @@ class Config:
     mcast_group: str = "239.255.0.1"
     mcast_port: int = 5000
     role: str = "FOLLOWER"
-    heartbeat_interval: float = 1.0
-    heartbeat_timeout: float = 3.0
+    heartbeat_interval: float = 0.8
+    heartbeat_timeout: float = 2.5
     election_timeout: float = 2.0
     ack_timeout: float = 1.5
 
@@ -39,30 +40,30 @@ class Config:
 class NodeLogFormatter(logging.Formatter):
     """Formats log messages with timestamps and observable [Node <id> | <ROLE>] prefixes."""
 
-    def __init__(self, node_id: int, role: str) -> None:
+    def __init__(self, node_id: int, role_getter: Any) -> None:
         super().__init__()
         self.node_id = node_id
-        self.role = role
+        self.role_getter = role_getter if callable(role_getter) else (lambda: role_getter)
 
     def format(self, record: logging.LogRecord) -> str:
         timestamp = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
         msecs = int(record.msecs)
+        current_role = self.role_getter()
         return (
-            f"{timestamp}.{msecs:03d} [Node {self.node_id} | {self.role}] "
+            f"{timestamp}.{msecs:03d} [Node {self.node_id} | {current_role}] "
             f"{record.levelname}: {record.getMessage()}"
         )
 
 
-def setup_logger(node_id: int, role: str, level: int = logging.INFO) -> logging.Logger:
+def setup_logger(node_id: int, role_getter: Any, level: int = logging.INFO) -> logging.Logger:
     """Configure root and application logger with standardized distributed-systems formatting."""
     logger = logging.getLogger(f"Node-{node_id}")
     logger.setLevel(level)
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(level)
-    handler.setFormatter(NodeLogFormatter(node_id, role))
+    handler.setFormatter(NodeLogFormatter(node_id, role_getter))
 
-    # Remove existing handlers to avoid duplication
     logger.handlers.clear()
     logger.addHandler(handler)
     logger.propagate = False
@@ -70,13 +71,7 @@ def setup_logger(node_id: int, role: str, level: int = logging.INFO) -> logging.
 
 
 async def run_m1_demo(config: Config, logger: logging.Logger) -> None:
-    """
-    Milestone 1 Demo Mode:
-    - Runs TCP server and UDP multicast listener.
-    - Periodically broadcasts TEST_UDP to the multicast group.
-    - Upon receiving TEST_UDP from another node, initiates a framed TCP TEST_TCP exchange.
-    - Responds to incoming TCP TEST_TCP messages with framed PONG responses.
-    """
+    """Milestone 1 Demo Mode: framed TCP and UDP multicast ping-pong."""
     logger.info(
         "Starting Milestone 1 Demo (TCP Port: %d, Multicast: %s:%d)",
         config.tcp_port,
@@ -96,7 +91,7 @@ async def run_m1_demo(config: Config, logger: logging.Logger) -> None:
         sender = msg.get("sender_id")
         logger.info("TCP received %s from node %s (%s)", mtype, sender, peer)
 
-        if mtype == MessageType.TEST_TCP or mtype == MessageType.PING:
+        if mtype in (MessageType.TEST_TCP, MessageType.PING):
             reply = create_message(
                 MessageType.PONG,
                 config.node_id,
@@ -110,7 +105,6 @@ async def run_m1_demo(config: Config, logger: logging.Logger) -> None:
         sender = msg.get("sender_id")
         mtype = msg.get("type")
         if sender == config.node_id:
-            # Multicast loopback received (confirms SO_REUSEPORT and loopback work)
             logger.debug("Received own UDP multicast datagram via loopback from %s", addr)
             return
 
@@ -122,8 +116,6 @@ async def run_m1_demo(config: Config, logger: logging.Logger) -> None:
             if peer_port and sender not in discovered_peers:
                 discovered_peers[sender] = {"host": peer_host, "port": peer_port}
                 logger.info("Discovered new peer node %s at %s:%d", sender, peer_host, peer_port)
-
-                # Connect over TCP to verify framed communication
                 asyncio.create_task(test_tcp_connection(peer_host, peer_port, sender))
 
     tcp_transport = TcpTransport(
@@ -144,7 +136,7 @@ async def run_m1_demo(config: Config, logger: logging.Logger) -> None:
     )
 
     async def test_tcp_connection(peer_host: str, peer_port: int, target_id: int) -> None:
-        await asyncio.sleep(0.5)  # slight delay before initiating TCP connect
+        await asyncio.sleep(0.5)
         try:
             req = create_message(
                 MessageType.TEST_TCP,
@@ -172,9 +164,8 @@ async def run_m1_demo(config: Config, logger: logging.Logger) -> None:
         try:
             loop.add_signal_handler(sig, signal_handler)
         except NotImplementedError:
-            pass  # Windows fallback
+            pass
 
-    # Periodic multicast broadcast loop
     async def broadcast_loop() -> None:
         while not stop_event.is_set():
             beacon = create_message(
@@ -186,7 +177,6 @@ async def run_m1_demo(config: Config, logger: logging.Logger) -> None:
             )
             try:
                 await mcast_transport.send(beacon)
-                logger.debug("Broadcasted TEST_UDP multicast beacon")
             except Exception as e:
                 logger.warning("Error broadcasting multicast beacon: %s", e)
 
@@ -206,7 +196,90 @@ async def run_m1_demo(config: Config, logger: logging.Logger) -> None:
         logger.info("Node %d shut down cleanly", config.node_id)
 
 
-def parse_args() -> Config:
+async def run_node(config: Config) -> None:
+    """Run full distributed chat room node (Milestone 2+)."""
+    node = Node(
+        node_id=config.node_id,
+        host=config.host,
+        tcp_port=config.tcp_port,
+        mcast_group=config.mcast_group,
+        mcast_port=config.mcast_port,
+        initial_role=config.role,
+        heartbeat_interval=config.heartbeat_interval,
+        heartbeat_timeout=config.heartbeat_timeout,
+    )
+
+    logger = setup_logger(config.node_id, lambda: node.role)
+    node.logger = logger
+    node.tcp_transport.logger = logger
+    node.mcast_transport.logger = logger
+    node.membership.logger = logger
+
+    await node.start()
+
+    stop_event = asyncio.Event()
+
+    def signal_handler() -> None:
+        logger.info("Shutdown signal caught. Commencing clean leave...")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            pass
+
+    # Non-blocking terminal CLI reader if running in interactive terminal
+    async def stdin_reader() -> None:
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        try:
+            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        except Exception:
+            return  # Stdin not attached or not pipeable
+
+        while not stop_event.is_set():
+            line_bytes = await reader.readline()
+            if not line_bytes:
+                break
+            cmd = line_bytes.decode("utf-8").strip()
+            if cmd == "/members":
+                members = node.table.all_members()
+                logger.info("Current Cluster Members (%d total):", len(members))
+                for m in members:
+                    alive_str = "ALIVE" if m.is_alive else "SUSPECTED/CRASHED"
+                    logger.info(
+                        "  - Node %d: %s:%d [%s] (status: %s, last seen: %.1fs ago)",
+                        m.node_id,
+                        m.host,
+                        m.port,
+                        m.role,
+                        alive_str,
+                        time.time() - m.last_seen,
+                    )
+            elif cmd == "/status":
+                logger.info(
+                    "Node Status: Node ID %d | Role: %s | Leader: %s | Port: %d",
+                    node.node_id,
+                    node.role,
+                    node.leader_id,
+                    node.tcp_port,
+                )
+            elif cmd in ("/leave", "/quit"):
+                stop_event.set()
+                break
+
+    stdin_task = asyncio.create_task(stdin_reader())
+
+    try:
+        await stop_event.wait()
+    finally:
+        stdin_task.cancel()
+        await node.stop()
+
+
+def parse_args() -> Tuple[Config, bool]:
     """Parse command line arguments into Config dataclass."""
     parser = argparse.ArgumentParser(
         description="Group 53 Distributed Peer-to-Peer Chat Room Node",
@@ -249,6 +322,18 @@ def parse_args() -> Config:
         help="Initial node role (default: FOLLOWER)",
     )
     parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=0.8,
+        help="Multicast heartbeat interval in seconds (default: 0.8)",
+    )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        default=2.5,
+        help="Heartbeat silence timeout before declaring crash in seconds (default: 2.5)",
+    )
+    parser.add_argument(
         "--demo-ping",
         action="store_true",
         help="Run Milestone 1 interactive transport test",
@@ -257,26 +342,34 @@ def parse_args() -> Config:
     args = parser.parse_args()
     resolved_host = get_lan_ip(args.host)
 
-    return Config(
+    cfg = Config(
         node_id=args.id,
         host=resolved_host,
         tcp_port=args.port,
         mcast_group=args.mcast_group,
         mcast_port=args.mcast_port,
         role=args.role,
+        heartbeat_interval=args.heartbeat_interval,
+        heartbeat_timeout=args.heartbeat_timeout,
     )
+    return cfg, args.demo_ping
 
 
 def main() -> None:
     """Synchronous entrypoint."""
-    config = parse_args()
-    logger = setup_logger(config.node_id, config.role)
-    logger.info("Initializing Node %d on %s:%d", config.node_id, config.host, config.tcp_port)
-
-    try:
-        asyncio.run(run_m1_demo(config, logger))
-    except KeyboardInterrupt:
-        logger.info("Exiting on keyboard interrupt")
+    config, is_demo_ping = parse_args()
+    if is_demo_ping:
+        logger = setup_logger(config.node_id, config.role)
+        logger.info("Initializing Node %d on %s:%d in demo-ping mode", config.node_id, config.host, config.tcp_port)
+        try:
+            asyncio.run(run_m1_demo(config, logger))
+        except KeyboardInterrupt:
+            logger.info("Exiting on keyboard interrupt")
+    else:
+        try:
+            asyncio.run(run_node(config))
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
