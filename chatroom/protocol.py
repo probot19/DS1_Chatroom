@@ -223,6 +223,77 @@ def create_state_res_message(
     )
 
 
+# =====================================================================
+# Milestone 4: Reliable Totally Ordered Multicast Helpers
+# =====================================================================
+
+def create_chat_client_message(
+    sender_id: int,
+    msg_id: str,
+    text: str,
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.CHAT_CLIENT_TO_LEADER,
+        sender_id,
+        msg_id=str(msg_id),
+        text=str(text),
+    )
+
+
+def create_chat_ordered_message(
+    leader_id: int,
+    seq: int,
+    sender_id: int,
+    msg_id: str,
+    text: str,
+    orig_timestamp: Optional[float] = None,
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.CHAT_MULTICAST_ORDERED,
+        leader_id,
+        seq=int(seq),
+        origin_sender_id=int(sender_id),
+        msg_id=str(msg_id),
+        text=str(text),
+        orig_timestamp=float(orig_timestamp if orig_timestamp is not None else time.time()),
+    )
+
+
+def create_retransmit_req_message(
+    sender_id: int,
+    missing_seqs: list[int],
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.RETRANSMIT_REQ,
+        sender_id,
+        missing_seqs=[int(s) for s in missing_seqs],
+    )
+
+
+def create_retransmit_res_message(
+    sender_id: int,
+    messages: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.RETRANSMIT_RES,
+        sender_id,
+        messages=messages,
+    )
+
+
+def create_chat_ack_message(
+    sender_id: int,
+    msg_id: str,
+    seq: int,
+) -> Dict[str, Any]:
+    return create_message(
+        MessageType.CHAT_ACK,
+        sender_id,
+        msg_id=str(msg_id),
+        seq=int(seq),
+    )
+
+
 def encode_framed_bytes(msg: Dict[str, Any]) -> bytes:
     """
     Serialize a message dictionary to UTF-8 JSON bytes and prepend

@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from chatroom.election import ElectionManager
 from chatroom.membership import MembershipManager, MembershipTable
+from chatroom.multicast import MulticastManager, OrderedMessage
 from chatroom.protocol import MessageType, create_message, send_framed_message
 from chatroom.transport import MulticastTransport, TcpTransport, get_lan_ip
 
@@ -104,6 +105,19 @@ class Node:
             logger=self.logger,
         )
 
+        # Multicast Manager (Total Order Sequencer, Hold-Back Queue, Gap Detection)
+        self.multicast = MulticastManager(
+            node_id=self.node_id,
+            table=self.membership.table,
+            tcp_transport=self.tcp_transport,
+            role_getter=lambda: self.role,
+            leader_id_getter=lambda: self.leader_id,
+            ack_timeout=1.5,
+            retransmit_timeout=1.5,
+            on_deliver=self._on_chat_delivered,
+            logger=self.logger,
+        )
+
         self._is_running = False
 
     @property
@@ -120,23 +134,44 @@ class Node:
 
     def _get_local_state(self) -> Tuple[int, list]:
         """Return (max_delivered_seq, chat_history_list) for state reconciliation."""
-        return self.local_max_seq, self.local_history
+        multicast_seq = self.multicast.current_seq if self.role == "LEADER" else (self.multicast.expected_seq - 1)
+        max_seq = max(self.local_max_seq, multicast_seq)
+        history = [m.to_dict() for m in self.multicast.delivered_messages] if self.multicast.delivered_messages else self.local_history
+        return max_seq, history
 
     def _on_elected(self, leader_id: int, max_seq: int, history: list) -> None:
         """Callback when this node wins election and finishes reconciliation."""
         self.membership.role = "LEADER"
         self.membership.leader_id = leader_id
         self.local_max_seq = max_seq
-        self.local_history = history
+        self.multicast.current_seq = max_seq
+
+        # Populate sequencer chat history with reconciled history
+        for item in history:
+            if isinstance(item, dict) and "seq" in item:
+                m = OrderedMessage.from_dict(item)
+                self.multicast.chat_history[m.seq] = m
+                self.multicast.seen_msg_ids[m.msg_id] = m.seq
+
         self.logger.info("Node %d is elected LEADER. Reconciled max sequence: %d", leader_id, max_seq)
 
     def _on_new_leader(self, leader_id: int, max_seq: int) -> None:
         """Callback when another node claims COORDINATOR."""
         self.membership.role = "FOLLOWER"
         self.membership.leader_id = leader_id
-        if max_seq > self.local_max_seq:
-            self.local_max_seq = max_seq
         self.logger.info("Acknowledged new cluster LEADER Node %d (max_seq=%d)", leader_id, max_seq)
+
+    def _on_chat_delivered(self, msg: OrderedMessage) -> None:
+        """Callback when a chat message is delivered in total order."""
+        pass
+
+    async def send_chat(self, text: str, msg_id: Optional[str] = None) -> str:
+        """Public API: send a chat message to the room with Total Order."""
+        return await self.multicast.send_chat(text, msg_id)
+
+    def get_delivered_messages(self) -> List[OrderedMessage]:
+        """Return sequential delivery log."""
+        return list(self.multicast.delivered_messages)
 
     def _on_leader_crashed(self, leader_id: int) -> None:
         """Invoked by failure detector when heartbeat timeout expires for leader."""
@@ -178,6 +213,11 @@ class Node:
 
         # 2. Membership messages (JOIN, LEAVE, MEMBERSHIP_UPDATE)
         handled = await self.membership.handle_tcp_message(msg, reader, writer)
+        if handled:
+            return
+
+        # 3. Multicast & Chat messages (CHAT_CLIENT_TO_LEADER, CHAT_MULTICAST_ORDERED, RETRANSMIT_REQ/RES)
+        handled = await self.multicast.handle_tcp_message(msg, reader, writer)
         if handled:
             return
 
